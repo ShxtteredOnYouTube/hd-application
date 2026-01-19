@@ -1,342 +1,440 @@
 -- // CONSTANTS
-local GRID_SIZE = 1 -- size of the grid (i set it to 1 as the grid texture is the default baseplate one which uses 1 stud gaps)
-local GRID_TRANS = 0.8 -- transparency of the grid
-local GRID_LERP = 14 -- animating speed of the grid
-local MOVE_LERP = 18 -- animating speed of the object
-local ROT_LERP = 16 -- rotation speed of the greed
-
-
+local GRID_SIZE = 1
+local GRID_TRANSPARENCY = 0.8
+local GRID_LERP_SPEED = 14
+local MOVE_LERP_SPEED = 18
 
 -- // SERVICES
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
-local UIS = game:GetService("UserInputService")
+local UserInputService = game:GetService("UserInputService")
 local TweenService = game:GetService("TweenService")
-local RS = game:GetService("ReplicatedStorage")
-
-
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
 
 -- // DEPENDENCIES
 local player = Players.LocalPlayer
-local camera = workspace.CurrentCamera
 local mouse = player:GetMouse()
-local re = RS:WaitForChild("PlaceObject")
+local camera = workspace.CurrentCamera
 
-local gridlines = workspace:WaitForChild("Gridlines")
-local tex1 = gridlines.TopTexture
-local tex2 = gridlines.BottomTexture
+local PlaceRemote = ReplicatedStorage:WaitForChild("PlaceObject")
+local ObjectsFolder = ReplicatedStorage:WaitForChild("Objects")
 
-local playerbuilds = workspace:WaitForChild("Builds"):WaitForChild(player.Name)
-local objects = RS:WaitForChild("Objects")
+local Gridlines = workspace:WaitForChild("Gridlines")
+local GridTop = Gridlines.TopTexture
+local GridBottom = Gridlines.BottomTexture
 
-local objectstbl = {} -- array of all objects
-local sftypes = {} -- array of all surfaces
+local PlayerBuilds = workspace:WaitForChild("Builds"):WaitForChild(player.Name)
 
-for _, obj in objects:GetChildren() do
-	table.insert(objectstbl, obj.Name)
-	sftypes[obj.Name] = obj:GetAttribute("SurfaceType")
+-- // PLACEMENT SOLVER
+--[[
+THese methods are responsible for checking surfaces and computing CFrames for
+different surface types like the ground, walls and ceilings so spatial logic doesnt
+get mixed up with other non-related things.
+]]
+
+local PlacementSolver = {}
+
+function PlacementSolver.snap(v)
+	return math.floor(v / GRID_SIZE + 0.5) * GRID_SIZE -- Snap the axis to the nearest increment
 end
 
-
-
--- // VARIABLES
-local preview = nil
-local index = math.random(1, #objectstbl)
-
-local rotY = 0
-local smoothRotY = 0
-local gridY = 0
-local targetCF = nil
-
-local buildloopconn = nil
-local deleteloopconn = nil
-local currentSelection = nil
-
-local placeDebounce = false
-
-local tweeninfo = TweenInfo.new(.35, Enum.EasingStyle.Exponential, Enum.EasingDirection.Out) -- tween info for selection boxes
-
-
-
--- // FUNCTIONS
-local function snap(v)
-	return math.floor(v / GRID_SIZE + 0.5) * GRID_SIZE -- to snap to the closest round integer in the grid
+function PlacementSolver.surfaceAllowed(surfaceType, normal) -- This makes it easy to determine if a surface can be placed on by simply comparing normals
+	if surfaceType == "Ground" then
+		return normal.Y > 0.9
+	elseif surfaceType == "Ceiling" then
+		return normal.Y < -0.9
+	elseif surfaceType == "Wall" then
+		return math.abs(normal.Y) < 0.5
+	end
+	return false
 end
 
-local function fadeGrid(on)
-	local t = on and GRID_TRANS or 1
-	TweenService:Create(tex1, TweenInfo.new(0.2), {Transparency = t}):Play()
-	TweenService:Create(tex2, TweenInfo.new(0.2), {Transparency = t}):Play()
+function PlacementSolver.computeGroundCF(hitPos, preview, rotY)
+	local y = hitPos.Y + preview.PrimaryPart.Size.Y / 2 -- We add half the size of the model as the model is pivoted based on its center, so incrementing the position by its half prevents clipping
+	return CFrame.new(
+		PlacementSolver.snap(hitPos.X),
+		y,
+		PlacementSolver.snap(hitPos.Z)
+	) * CFrame.Angles(0, math.rad(rotY), 0)
 end
 
-local function createPreview()
-	if preview then preview:Destroy() end
+function PlacementSolver.computeCeilingCF(hitPos, preview, rotY)
+	local y = hitPos.Y - preview.PrimaryPart.Size.Y / 2 -- Similarly, we subtract half the size of the model so it doesn't clip through the ceiling
+	return CFrame.new(
+		PlacementSolver.snap(hitPos.X),
+		y,
+		PlacementSolver.snap(hitPos.Z)
+	) * CFrame.Angles(0, math.rad(rotY), 0)
+end
 
-	preview = objects[objectstbl[index]]:Clone()
-	preview.Parent = workspace
-	targetCF = preview.PrimaryPart.CFrame
+function PlacementSolver.computeWallCF(hitPos, normal, preview, rotY)
+	local depth = preview:GetExtentsSize().Z / 2 -- Conceptually the same, this is the depth by which the preview should be offseted from the wall (again, half the size)
+	local offset = hitPos + normal * depth
 
-	for _, p in preview:GetDescendants() do -- make the preview visuals
-		if p:IsA("BasePart") and p ~= preview.PrimaryPart then
-			p.Material = Enum.Material.ForceField
-			p.Transparency = 0
-			p.CanCollide = false
+	offset = Vector3.new(
+		offset.X,
+		PlacementSolver.snap(offset.Y),
+		offset.Z
+	)
+
+	local lookCF = CFrame.lookAt(offset, offset - normal) -- This is so the preview maintains the same orientation respective to the normal when the cursor is pointed at a different surface of the same type
+	return lookCF * CFrame.Angles(0, math.rad(rotY), 0)
+end
+
+-- // PREVIEW CLASS
+local PreviewObject = {}
+PreviewObject.__index = PreviewObject -- Set the __index of the metatable so lookups are directed into here
+
+function PreviewObject.new(template)
+	local self = setmetatable({}, PreviewObject) -- THis creates an object in the metatable representig the preview so its easy to work with
+
+	self.Model = template:Clone()
+	self.Model.Parent = workspace
+	self.TargetCF = self.Model.PrimaryPart.CFrame
+
+	for _, part in self.Model:GetDescendants() do
+		if part:IsA("BasePart") and part ~= self.Model.PrimaryPart then
+			part.CanCollide = false
+			part.Material = Enum.Material.ForceField
+			part.Transparency = 0
+		end
+	end
+
+	return self
+end
+
+function PreviewObject:setTarget(cf)
+	self.TargetCF = cf
+end
+
+function PreviewObject:update(dt)
+	self.Model:SetPrimaryPartCFrame(
+		self.Model.PrimaryPart.CFrame:Lerp(
+			self.TargetCF,
+			math.clamp(dt * MOVE_LERP_SPEED, 0, 1) -- To create the smooth movement animation when the preview follows the cursor around
+		)
+	)
+end
+
+function PreviewObject:setColor(color)
+	for _, part in self.Model:GetDescendants() do
+		if part:IsA("BasePart") then
+			part.Color = color
 		end
 	end
 end
 
-local function previewColorFeedback(c)
-	for _, p in preview:GetDescendants() do -- red or green color feedback based on validity
-		if p:IsA("BasePart") and p ~= preview.PrimaryPart then
-			p.Color = c
+function PreviewObject:destroy()
+	self.Model:Destroy()
+end
+
+-- // BUILD CLASS
+local BuildSession = {}
+BuildSession.__index = BuildSession -- Similarly, the __index is set so lookups are directed into here
+
+function BuildSession.new(objects, surfaceTypes)
+	local self = setmetatable({}, BuildSession) -- Again, creates a new object in the metatable
+
+	self.ObjectNames = objects
+	self.SurfaceTypes = surfaceTypes
+	self.Index = math.random(1, #objects)
+	self.RotationY = 0
+	self.GridY = 0
+
+	self.Preview = nil
+	self.RenderConn = nil
+	self.PlaceDebounce = false
+
+	return self
+end
+
+function BuildSession:start() -- Start build mode by creating the preview and making the grid appear
+	self:createPreview()
+	self:fadeGrid(true)
+
+	self.RenderConn = RunService.RenderStepped:Connect(function(dt)
+		self:update(dt)
+	end)
+end
+
+function BuildSession:createPreview()
+	if self.Preview then
+		self.Preview:destroy()
+	end
+
+	local name = self.ObjectNames[self.Index]
+	self.Preview = PreviewObject.new(ObjectsFolder[name])
+end
+
+function BuildSession:update(dt)
+	local name = self.ObjectNames[self.Index]
+	local surfaceType = self.SurfaceTypes[name]
+
+	local params = RaycastParams.new()
+	params.FilterDescendantsInstances = { self.Preview.Model, Gridlines } -- The model itself and the grid is ignored so the placement isn't weird
+	params.FilterType = Enum.RaycastFilterType.Blacklist
+
+	local ray = camera:ScreenPointToRay(mouse.X, mouse.Y)
+	local hit = workspace:Raycast(ray.Origin, ray.Direction * 1000, params)
+	if not hit then return end
+
+	local valid = PlacementSolver.surfaceAllowed(surfaceType, hit.Normal) -- Determine whether the surface can be placed on before continuing
+	local targetCF
+
+	if valid then -- Update the grid's position dynamically 
+		if surfaceType == "Ground" then
+			targetCF = PlacementSolver.computeGroundCF(hit.Position, self.Preview.Model, self.RotationY)
+			self:updateGrid(dt, hit.Position.Y) -- The computeGroundCF() function keeps the grid fixed to the ground when placing on the ground
+		elseif surfaceType == "Ceiling" then
+			targetCF = PlacementSolver.computeCeilingCF(hit.Position, self.Preview.Model, self.RotationY)
+			self:updateGrid(dt, hit.Position.Y) -- The computeCeilingCF() fixes the grid to the ceiling's surface so its easy to tell where on the grid you're placing a hanging object
+		elseif surfaceType == "Wall" then
+			targetCF = PlacementSolver.computeWallCF(hit.Position, hit.Normal, self.Preview.Model, self.RotationY)
+			self:updateGrid(dt, hit.Position.Y - 2) -- The computeWallCF() function dynamically moves the grid so its just under the preview object so its easy to tell where youre positioning it
 		end
+	end
+
+	if targetCF then
+		self.Preview:setTarget(targetCF)
+	end
+
+	self.Preview:update(dt)
+
+	local color = valid and Color3.fromRGB(0,255,0) or Color3.fromRGB(255,0,0)
+	self.Preview:setColor(color) -- This gives color feedback (i.e. green if valid, red if invalid) based on whether the current placing position is valid or not
+	GridTop.Color3 = color
+	GridBottom.Color3 = color
+
+	if valid
+		and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+		and not self.PlaceDebounce
+	then
+		self.PlaceDebounce = true -- This debounce prevents spam placement 
+		PlaceRemote:FireServer("place", name, self.Preview.Model.PrimaryPart.CFrame)
+		
+		task.delay(0.2, function()
+			self.PlaceDebounce = false
+		end)
 	end
 end
 
-local function gridColorFeedback(c)
-	tex1.Color3 = c -- same color feedback as in the preview
-	tex2.Color3 = c
+function BuildSession:fadeGrid(on)
+	local t = on and GRID_TRANSPARENCY or 1
+	TweenService:Create(GridTop, TweenInfo.new(0.2), {Transparency = t}):Play()
+	TweenService:Create(GridBottom, TweenInfo.new(0.2), {Transparency = t}):Play()
 end
 
-local function enterBuildModeLoop()
-	if buildloopconn then buildloopconn:Disconnect() end
+function BuildSession:updateGrid(dt, targetY)
+	self.GridY += (targetY - self.GridY) * dt * GRID_LERP_SPEED -- Update the grid's position with the lerp speed factored in
 
-	buildloopconn = RunService.RenderStepped:Connect(function(dt)
-		local objType = objectstbl[index]
-		local surfacetype = sftypes[objType]
+	Gridlines.CFrame = CFrame.new(
+			0,
+			self.GridY,
+			0
+		)
+end
 
-		local params = RaycastParams.new()
-		params.FilterDescendantsInstances = { preview, gridlines }
-		params.FilterType = Enum.RaycastFilterType.Blacklist
+function BuildSession:stop()
+	if self.RenderConn then
+		self.RenderConn:Disconnect()
+	end
+	if self.Preview then
+		self.Preview:destroy()
+	end
+	self:fadeGrid(false)
+end
 
-		local ray = camera:ScreenPointToRay(mouse.X, mouse.Y)
-		local hit = workspace:Raycast(ray.Origin, ray.Direction * 1000, params)
-		if not hit then return end
+-- // DELETE CLASS
+local DeleteSession = {}
+DeleteSession.__index = DeleteSession
 
-		local pos = hit.Position
-		local n = hit.Normal
-		local surfaceOK = false
+function DeleteSession.new()
+	local self = setmetatable({}, DeleteSession)
 
-		if surfacetype == "Ground" then -- deterministicically validate the placement position
-			surfaceOK = n.Y > 0.9
-		elseif surfacetype == "Ceiling" then
-			surfaceOK = n.Y < -0.9
-		elseif surfacetype == "Wall" then
-			surfaceOK = math.abs(n.Y) < 0.5
+	self.Highlight = Instance.new("Highlight")
+	self.Highlight.FillColor = Color3.fromRGB(255,60,60)
+	self.Highlight.OutlineTransparency = 1
+	self.Highlight.FillTransparency = 1
+	self.Highlight.OutlineColor = Color3.fromRGB(255,0,0)
+	self.Highlight.Enabled = false
+	self.Highlight.Parent = workspace
+
+
+	self.Target = nil
+	self.DeleteDebounce = false
+	self.RenderConn = nil
+
+	return self
+end
+
+function DeleteSession:fadeIn()
+	TweenService:Create(
+		self.Highlight,
+		TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{
+			FillTransparency = 0.5,
+			OutlineTransparency = 0
+		}
+	):Play()
+end
+
+function DeleteSession:fadeOut()
+	TweenService:Create(
+		self.Highlight,
+		TweenInfo.new(0.15, Enum.EasingStyle.Quad, Enum.EasingDirection.Out),
+		{
+			FillTransparency = 1,
+			OutlineTransparency = 1
+		}
+	):Play()
+end
+
+
+function DeleteSession:start()
+	self.RenderConn = RunService.RenderStepped:Connect(function()
+		self:update()
+	end)
+end
+
+function DeleteSession:update()
+	local ray = camera:ScreenPointToRay(mouse.X, mouse.Y)
+	local hit = workspace:Raycast(ray.Origin, ray.Direction * 1000)
+
+	local newTarget = nil
+
+	if hit and hit.Instance then
+		local model = hit.Instance:FindFirstAncestorOfClass("Model")
+		if model and model:IsDescendantOf(PlayerBuilds) then -- This makes it so that you can only select your own builds while in delete mode
+			newTarget = model
 		end
+	end
 
-		local valid = surfaceOK
+	if newTarget ~= self.Target then -- When the target changes:
 
-		if surfaceOK then
-			if surfacetype == "Ground" then -- here, we keep the grid fixed to the ground
-				local x = snap(pos.X)
-				local z = snap(pos.Z)
-				local y = pos.Y + preview.PrimaryPart.Size.Y / 2
-
-				targetCF =
-					CFrame.new(x, y, z)
-					* CFrame.Angles(0, math.rad(rotY), 0)
-
-				gridY = 0
-
-			elseif surfacetype == "Ceiling" then -- and here, we fix the grid to the ceiling normal
-				local x = snap(pos.X)
-				local z = snap(pos.Z)
-				local y = pos.Y - preview.PrimaryPart.Size.Y / 2
-
-				targetCF =
-					CFrame.new(x, y, z)
-					* CFrame.Angles(0, math.rad(rotY), 0)
-
-				gridY += (pos.Y - gridY) * math.clamp(dt * GRID_LERP, 0, 1)
-
-			elseif surfacetype == "Wall" then -- but for wall placement, we dynamically change the grid's Y level to match that of the cursor (+ a little bit of adjustment)
-				local size = preview:GetExtentsSize()
-				local depth = size.Z / 2
-
-				local placePos = pos + n * depth -- offset the placements by half the depth of the hitbox so it isnt clipping into the wall
-				placePos = Vector3.new(
-					placePos.X,
-					snap(placePos.Y),
-					placePos.Z
-				)
-
-				local lookCF =
-					CFrame.lookAt(
-						placePos,
-						placePos - n
-					)
-
-				targetCF =
-					lookCF
-					* CFrame.Angles(0, math.rad(rotY), 0)
-
-				gridY += (placePos.Y - gridY) * math.clamp(dt * GRID_LERP, 0, 1)
-			end
-
-			for _, p in workspace:GetPartsInPart(preview.PrimaryPart) do
-				if p.CanCollide and not p:IsDescendantOf(preview) then
-					valid = false
-					break
+		if self.Target then -- When the target is lost:
+			self:fadeOut()
+			task.delay(0.15, function()
+				if not self.Target then
+					self.Highlight.Enabled = false
 				end
-			end
+			end)
 		end
 
-		if targetCF then -- and finally we position the preview
-			preview:SetPrimaryPartCFrame(
-				preview.PrimaryPart.CFrame:Lerp(
-					targetCF,
-					math.clamp(dt * MOVE_LERP, 0, 1)
-				)
-			)
+		self.Target = newTarget
+
+		if self.Target then -- When the target is gained again:
+			self.Highlight.Adornee = self.Target
+			self.Highlight.Enabled = true
+			self:fadeIn()
 		end
-
-		gridlines.Position =
-			surfacetype == "Wall" and Vector3.new(0, gridY - 1, 0)
-			or surfacetype == "Ceiling" and Vector3.new(0, gridY, 0)
-			or Vector3.new(0, 0, 0)
-
-		previewColorFeedback(valid and Color3.fromRGB(0, 255, 0) or Color3.fromRGB(255, 0, 0))
-		gridColorFeedback(valid and Color3.fromRGB(80, 255, 80) or Color3.fromRGB(255, 80, 80))
-
-		if valid
-			and UIS:IsMouseButtonPressed(Enum.UserInputType.MouseButton1) -- beam the placement info when MB1 is clicked
-			and not placeDebounce
-		then
-			placeDebounce = true -- debounce so no spamming occurs
-			re:FireServer("place", objType, preview.PrimaryPart.CFrame)
-		end
-	end)
-end
-
-
-
-local function enterDeleteModeLoop()
-	if deleteloopconn then deleteloopconn:Disconnect() end -- disconnect any existing connections
-
-	deleteloopconn = RunService.RenderStepped:Connect(function()
-		local params = RaycastParams.new()
-		params.FilterDescendantsInstances = {gridlines}
-		params.FilterType = Enum.RaycastFilterType.Blacklist
-
-		local ray = camera:ScreenPointToRay(mouse.X, mouse.Y)
-		local hit = workspace:Raycast(ray.Origin, ray.Direction * 1000, params)
-
-		if not hit then
-			if currentSelection and currentSelection:FindFirstChild("DeleteSB") then
-				currentSelection.DeleteSB.Transparency = 1
-			end
-			currentSelection = nil
-			return
-		end
-
-		local model = hit.Instance:FindFirstAncestorOfClass("Model") -- find the actual object model
-		if not model
-			or not model:IsDescendantOf(playerbuilds)
-			or not model:FindFirstChild("DeleteSB") then
-
-			if currentSelection and currentSelection:FindFirstChild("DeleteSB") then -- show the hitbox when deleting an object
-				TweenService:Create(currentSelection.DeleteSB, tweeninfo, {Transparency = 1}):Play()
-			end
-			currentSelection = nil
-			return
-		end
-
-		if model ~= currentSelection then
-			if currentSelection and currentSelection:FindFirstChild("DeleteSB") then
-				TweenService:Create(currentSelection.DeleteSB, tweeninfo, {Transparency = 1}):Play()
-			end
-
-			currentSelection = model
-			TweenService:Create(currentSelection.DeleteSB, tweeninfo, {Transparency = 0}):Play()
-		end
-	end)
-end
-
-local function enterBuildMode()
-	rotY = 0
-	smoothRotY = 0
-	index = math.random(1, #objectstbl)
-	createPreview()
-	fadeGrid(true)
-	enterBuildModeLoop()
-end
-
-local function enterDeleteMode()
-	if buildloopconn then
-		buildloopconn:Disconnect()
-		buildloopconn = nil
 	end
 
-	if preview then
-		preview:Destroy()
-		preview = nil
+	if self.Target
+		and UserInputService:IsMouseButtonPressed(Enum.UserInputType.MouseButton1)
+		and not self.DeleteDebounce
+	then
+		self.DeleteDebounce = true
+		PlaceRemote:FireServer("delete", self.Target)
 	end
-
-	enterDeleteModeLoop()
 end
 
-local function exitDeleteMode()
-	if deleteloopconn then
-		deleteloopconn:Disconnect()
-		deleteloopconn = nil
+function DeleteSession:stop()
+	if self.RenderConn then
+		self.RenderConn:Disconnect() -- Delete the connection to prevent memory leaks
+		self.RenderConn = nil
 	end
 
-	if currentSelection and currentSelection:FindFirstChild("DeleteSB") then
-		TweenService:Create(currentSelection.DeleteSB, tweeninfo, {Transparency = 1}):Play()
+	self.Highlight.Enabled = false
+	self.Highlight:Destroy()
+end
+
+-- // BUILD CLASS
+local BuildController = {}
+BuildController.__index = BuildController
+
+function BuildController.new()
+	local self = setmetatable({}, BuildController) -- Create a new manager for objects
+
+	self.Objects = {}
+	self.SurfaceTypes = {}
+
+	for _, obj in ObjectsFolder:GetChildren() do
+		table.insert(self.Objects, obj.Name)
+		self.SurfaceTypes[obj.Name] = obj:GetAttribute("SurfaceType") -- The type of surface that an object can be placed on is stored as an attribute in the model itself, so we retrieve that here
 	end
-	currentSelection = nil
 
-	enterBuildMode()
+	self.Session = nil
+	self.DeleteSession = nil
+	self.Mode = "None"
+
+	return self
 end
 
-local function exitBuildMode()
-	if preview then preview:Destroy() preview = nil end
-	fadeGrid(false)
-
-	if buildloopconn then buildloopconn:Disconnect() buildloopconn = nil end -- disconnect all connections
-	if deleteloopconn then deleteloopconn:Disconnect() deleteloopconn = nil end
+function BuildController:enterBuildMode()
+	self.Session = BuildSession.new(self.Objects, self.SurfaceTypes)
+	self.Session:start() -- Create a new session and enter build mode
+	self.Mode = "Build"
 end
 
+function BuildController:enterDeleteMode()
+	if self.Session then
+		self.Session:stop() -- Before entering DELETE mode, we stop build mode to prevent any inference
+		self.Session = nil
+	end
+	self.DeleteSession = DeleteSession.new()
+	self.DeleteSession:start()
+	self.Mode = "Delete"
+end
 
+function BuildController:exitAll()
+	if self.Session then self.Session:stop() end
+	if self.DeleteSession then self.DeleteSession:stop() end
+	self.Session = nil
+	self.DeleteSession = nil
+	self.Mode = "None"
+end
 
+-- // INPUT HANDLING
+local Controller = BuildController.new()
 
--- // HANDLER
-UIS.InputBegan:Connect(function(i, gp)
+UserInputService.InputBegan:Connect(function(input, gp)
 	if gp then return end
 
-	if i.KeyCode == Enum.KeyCode.E then -- listener to toggle build mode with E
-		if buildloopconn or deleteloopconn then
-			exitBuildMode()
+	if input.KeyCode == Enum.KeyCode.E then -- E as the toggle for build mode
+		if Controller.Mode == "None" then
+			Controller:enterBuildMode()
 		else
-			enterBuildMode()
+			Controller:exitAll()
 		end
 
-	elseif buildloopconn then
-		if i.KeyCode == Enum.KeyCode.R then -- rotate with R
-			rotY += 90
-		elseif i.KeyCode == Enum.KeyCode.X then -- next object with X
-			index = index % #objectstbl + 1
-			createPreview()
-		elseif i.KeyCode == Enum.KeyCode.Z then -- previous object with Z
-			index = (index - 2) % #objectstbl + 1
-			createPreview()
-		elseif i.KeyCode == Enum.KeyCode.V then -- listener to enter delete mode with V
-			enterDeleteMode()
+	elseif input.KeyCode == Enum.KeyCode.V then -- V as the toggle for delete mode
+		if Controller.Mode == "Build" then
+			Controller:enterDeleteMode()
+		elseif Controller.Mode == "Delete" then
+			Controller:exitAll()
+			Controller:enterBuildMode()
 		end
 
-	elseif deleteloopconn then
-		if i.KeyCode == Enum.KeyCode.V then -- listener to exit delete mode with V
-			exitDeleteMode()
-		elseif i.UserInputType == Enum.UserInputType.MouseButton1 and currentSelection then -- listener to delete when MB1 is clicked
-			re:FireServer("delete", currentSelection)
-			currentSelection = nil
+	elseif Controller.Mode == "Build" and Controller.Session then
+		if input.KeyCode == Enum.KeyCode.R then
+			Controller.Session.RotationY += 90
+		elseif input.KeyCode == Enum.KeyCode.X then
+			Controller.Session.Index = Controller.Session.Index % #Controller.Objects + 1 -- Skip to the next object
+			Controller.Session:createPreview()
+		elseif input.KeyCode == Enum.KeyCode.Z then
+			Controller.Session.Index = (Controller.Session.Index - 2) % #Controller.Objects + 1 -- Go back to the previous object
+			Controller.Session:createPreview()
 		end
 	end
 end)
 
-UIS.InputEnded:Connect(function(i)
-	if i.UserInputType == Enum.UserInputType.MouseButton1 then -- debounce to prevent multiple object placements at once
-		placeDebounce = false
+UserInputService.InputEnded:Connect(function(input)
+	if input.UserInputType == Enum.UserInputType.MouseButton1 then
+		if Controller.Session then
+			Controller.Session.PlaceDebounce = false
+		end
+		if Controller.DeleteSession then
+			Controller.DeleteSession.DeleteDebounce = false
+		end
 	end
 end)
